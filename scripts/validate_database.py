@@ -101,6 +101,46 @@ def create_database_engine() -> Engine:
         pool_pre_ping=True,
     )
 
+# ============================================================
+# REQUIRED-FIELD VALIDATION RULES
+# ============================================================
+
+REQUIRED_FIELDS = {
+    "hosp": {
+        "patients": [
+            "subject_id",
+        ],
+        "admissions": [
+            "subject_id",
+            "hadm_id",
+        ],
+    },
+    "icu": {
+        "icustays": [
+            "subject_id",
+            "hadm_id",
+            "stay_id",
+        ],
+        "chartevents": [
+            "subject_id",
+            "hadm_id",
+            "stay_id",
+        ],
+    },
+}
+
+REPORT_COLUMNS = [
+    "schema",
+    "table",
+    "column",
+    "check",
+    "row_count",
+    "checked_rows",
+    "null_count",
+    "null_percentage",
+    "status",
+    "message",
+]
 
 # ============================================================
 # VALIDATION HELPERS
@@ -150,6 +190,57 @@ def count_table_rows(
 
     return int(row_count)
 
+def count_null_values(
+    engine: Engine,
+    schema_name: str,
+    table_name: str,
+    column_name: str,
+) -> tuple[int, int, float]:
+    """
+    Count total rows and SQL NULL values for one database column.
+
+    Returns
+    -------
+    tuple[int, int, float]
+        The number of checked rows, number of null values,
+        and percentage of null values.
+    """
+
+    qualified_table_name = build_qualified_table_name(
+        engine=engine,
+        schema_name=schema_name,
+        table_name=table_name,
+    )
+
+    preparer = engine.dialect.identifier_preparer
+    quoted_column_name = preparer.quote(column_name)
+
+    query = text(
+        f"""
+        SELECT
+            COUNT(*) AS checked_rows,
+            COUNT(*) FILTER (
+                WHERE {quoted_column_name} IS NULL
+            ) AS null_count
+        FROM {qualified_table_name}
+        """
+    )
+
+    with engine.connect() as connection:
+        result = connection.execute(query).mappings().one()
+
+    checked_rows = int(result["checked_rows"])
+    null_count = int(result["null_count"])
+
+    if checked_rows == 0:
+        null_percentage = 0.0
+    else:
+        null_percentage = round(
+            (null_count / checked_rows) * 100,
+            4,
+        )
+
+    return checked_rows, null_count, null_percentage
 
 # ============================================================
 # DATABASE INVENTORY VALIDATION
@@ -289,6 +380,192 @@ def validate_database_inventory(engine: Engine) -> pd.DataFrame:
 
     return pd.DataFrame(results)
 
+# ============================================================
+# REQUIRED-FIELD NULL VALIDATION
+# ============================================================
+
+def validate_required_fields(engine: Engine) -> pd.DataFrame:
+    """
+    Validate that critical identifier columns contain no SQL NULL values.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row for each required-field validation check.
+    """
+
+    inspector = inspect(engine)
+    available_schemas = set(inspector.get_schema_names())
+
+    results: list[dict[str, object]] = []
+
+    for schema_name, table_rules in REQUIRED_FIELDS.items():
+        logging.info(
+            "Starting required-field validation for schema: %s",
+            schema_name,
+        )
+
+        if schema_name not in available_schemas:
+            for table_name, required_columns in table_rules.items():
+                for column_name in required_columns:
+                    results.append(
+                        {
+                            "schema": schema_name,
+                            "table": table_name,
+                            "column": column_name,
+                            "check": "required_field_not_null",
+                            "checked_rows": None,
+                            "null_count": None,
+                            "null_percentage": None,
+                            "status": "FAIL",
+                            "message": (
+                                f"Required-field validation could not run "
+                                f"because schema '{schema_name}' was not found."
+                            ),
+                        }
+                    )
+
+            continue
+
+        available_tables = set(
+            inspector.get_table_names(schema=schema_name)
+        )
+
+        for table_name, required_columns in table_rules.items():
+            logging.info(
+                "Validating required fields for table: %s.%s",
+                schema_name,
+                table_name,
+            )
+
+            if table_name not in available_tables:
+                for column_name in required_columns:
+                    results.append(
+                        {
+                            "schema": schema_name,
+                            "table": table_name,
+                            "column": column_name,
+                            "check": "required_field_not_null",
+                            "checked_rows": None,
+                            "null_count": None,
+                            "null_percentage": None,
+                            "status": "FAIL",
+                            "message": (
+                                f"Required-field validation could not run "
+                                f"because table "
+                                f"'{schema_name}.{table_name}' was not found."
+                            ),
+                        }
+                    )
+
+                continue
+
+            available_columns = {
+                column["name"]
+                for column in inspector.get_columns(
+                    table_name=table_name,
+                    schema=schema_name,
+                )
+            }
+
+            for column_name in required_columns:
+                logging.info(
+                    "Checking null values: %s.%s.%s",
+                    schema_name,
+                    table_name,
+                    column_name,
+                )
+
+                if column_name not in available_columns:
+                    results.append(
+                        {
+                            "schema": schema_name,
+                            "table": table_name,
+                            "column": column_name,
+                            "check": "required_field_not_null",
+                            "checked_rows": None,
+                            "null_count": None,
+                            "null_percentage": None,
+                            "status": "FAIL",
+                            "message": (
+                                f"Required column "
+                                f"'{schema_name}.{table_name}.{column_name}' "
+                                "was not found."
+                            ),
+                        }
+                    )
+
+                    continue
+
+                try:
+                    (
+                        checked_rows,
+                        null_count,
+                        null_percentage,
+                    ) = count_null_values(
+                        engine=engine,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        column_name=column_name,
+                    )
+
+                    if null_count == 0:
+                        status = "PASS"
+                        message = (
+                            f"Column "
+                            f"'{schema_name}.{table_name}.{column_name}' "
+                            f"contains no null values across "
+                            f"{checked_rows:,} rows."
+                        )
+                    else:
+                        status = "FAIL"
+                        message = (
+                            f"Column "
+                            f"'{schema_name}.{table_name}.{column_name}' "
+                            f"contains {null_count:,} null values "
+                            f"({null_percentage:.4f}%)."
+                        )
+
+                    results.append(
+                        {
+                            "schema": schema_name,
+                            "table": table_name,
+                            "column": column_name,
+                            "check": "required_field_not_null",
+                            "checked_rows": checked_rows,
+                            "null_count": null_count,
+                            "null_percentage": null_percentage,
+                            "status": status,
+                            "message": message,
+                        }
+                    )
+
+                except Exception as error:
+                    logging.exception(
+                        "Unable to validate null values for %s.%s.%s",
+                        schema_name,
+                        table_name,
+                        column_name,
+                    )
+
+                    results.append(
+                        {
+                            "schema": schema_name,
+                            "table": table_name,
+                            "column": column_name,
+                            "check": "required_field_not_null",
+                            "checked_rows": None,
+                            "null_count": None,
+                            "null_percentage": None,
+                            "status": "FAIL",
+                            "message": (
+                                "Null validation could not be completed: "
+                                f"{error}"
+                            ),
+                        }
+                    )
+
+    return pd.DataFrame(results)
 
 # ============================================================
 # REPORTING
@@ -296,12 +573,14 @@ def validate_database_inventory(engine: Engine) -> pd.DataFrame:
 
 def save_validation_report(results: pd.DataFrame) -> None:
     """
-    Save validation results as a CSV file.
+    Save validation results as a CSV file using a consistent column order.
     """
 
     REPORT_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
-    results.to_csv(
+    ordered_results = results.reindex(columns=REPORT_COLUMNS)
+
+    ordered_results.to_csv(
         REPORT_FILE,
         index=False,
         encoding="utf-8",
@@ -360,7 +639,18 @@ def main() -> None:
     engine = create_database_engine()
 
     try:
-        results = validate_database_inventory(engine)
+        inventory_results = validate_database_inventory(engine)
+        required_field_results = validate_required_fields(engine)
+
+        results = pd.concat(
+            [
+                inventory_results,
+                required_field_results,
+            ],
+            ignore_index=True,
+            sort=False,
+        )
+
         save_validation_report(results)
         print_validation_summary(results)
 
