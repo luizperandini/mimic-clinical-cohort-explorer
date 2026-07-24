@@ -138,9 +138,34 @@ REPORT_COLUMNS = [
     "checked_rows",
     "null_count",
     "null_percentage",
+    "key_columns",
+    "duplicate_group_count",
+    "duplicate_row_count",
+    "duplicate_percentage",
     "status",
     "message",
 ]
+
+
+# ============================================================
+# UNIQUE-KEY VALIDATION RULES
+# ============================================================
+
+UNIQUE_KEYS = {
+    "hosp": {
+        "patients": [
+            "subject_id",
+        ],
+        "admissions": [
+            "hadm_id",
+        ],
+    },
+    "icu": {
+        "icustays": [
+            "stay_id",
+        ],
+    },
+}
 
 # ============================================================
 # VALIDATION HELPERS
@@ -241,6 +266,99 @@ def count_null_values(
         )
 
     return checked_rows, null_count, null_percentage
+
+
+def count_duplicate_keys(
+    engine: Engine,
+    schema_name: str,
+    table_name: str,
+    key_columns: list[str],
+) -> tuple[int, int, int, float]:
+    """
+    Count duplicate key groups and extra duplicate rows.
+
+    Parameters
+    ----------
+    engine
+        Active SQLAlchemy database engine.
+    schema_name
+        PostgreSQL schema containing the table.
+    table_name
+        Table being validated.
+    key_columns
+        Column or columns expected to uniquely identify each row.
+
+    Returns
+    -------
+    tuple[int, int, int, float]
+        Checked rows, duplicate groups, extra duplicate rows,
+        and duplicate-row percentage.
+    """
+
+    qualified_table_name = build_qualified_table_name(
+        engine=engine,
+        schema_name=schema_name,
+        table_name=table_name,
+    )
+
+    preparer = engine.dialect.identifier_preparer
+
+    quoted_key_columns = [
+        preparer.quote(column_name)
+        for column_name in key_columns
+    ]
+
+    key_expression = ", ".join(quoted_key_columns)
+
+    query = text(
+        f"""
+        WITH duplicate_groups AS (
+            SELECT
+                {key_expression},
+                COUNT(*) AS group_size
+            FROM {qualified_table_name}
+            GROUP BY {key_expression}
+            HAVING COUNT(*) > 1
+        )
+        SELECT
+            (
+                SELECT COUNT(*)
+                FROM {qualified_table_name}
+            ) AS checked_rows,
+            COUNT(*) AS duplicate_group_count,
+            COALESCE(
+                SUM(group_size - 1),
+                0
+            ) AS duplicate_row_count
+        FROM duplicate_groups
+        """
+    )
+
+    with engine.connect() as connection:
+        result = connection.execute(query).mappings().one()
+
+    checked_rows = int(result["checked_rows"])
+    duplicate_group_count = int(
+        result["duplicate_group_count"]
+    )
+    duplicate_row_count = int(
+        result["duplicate_row_count"]
+    )
+
+    if checked_rows == 0:
+        duplicate_percentage = 0.0
+    else:
+        duplicate_percentage = round(
+            (duplicate_row_count / checked_rows) * 100,
+            4,
+        )
+
+    return (
+        checked_rows,
+        duplicate_group_count,
+        duplicate_row_count,
+        duplicate_percentage,
+    )
 
 # ============================================================
 # DATABASE INVENTORY VALIDATION
@@ -567,6 +685,222 @@ def validate_required_fields(engine: Engine) -> pd.DataFrame:
 
     return pd.DataFrame(results)
 
+
+# ============================================================
+# UNIQUE-KEY DUPLICATE VALIDATION
+# ============================================================
+
+def validate_unique_keys(engine: Engine) -> pd.DataFrame:
+    """
+    Validate that configured logical keys contain no duplicates.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row for each unique-key validation check.
+    """
+
+    inspector = inspect(engine)
+    available_schemas = set(inspector.get_schema_names())
+
+    results: list[dict[str, object]] = []
+
+    for schema_name, table_rules in UNIQUE_KEYS.items():
+        logging.info(
+            "Starting unique-key validation for schema: %s",
+            schema_name,
+        )
+
+        if schema_name not in available_schemas:
+            for table_name, key_columns in table_rules.items():
+                key_label = ", ".join(key_columns)
+
+                results.append(
+                    {
+                        "schema": schema_name,
+                        "table": table_name,
+                        "key_columns": key_label,
+                        "check": "unique_key_no_duplicates",
+                        "checked_rows": None,
+                        "duplicate_group_count": None,
+                        "duplicate_row_count": None,
+                        "duplicate_percentage": None,
+                        "status": "FAIL",
+                        "message": (
+                            "Unique-key validation could not run "
+                            f"because schema '{schema_name}' "
+                            "was not found."
+                        ),
+                    }
+                )
+
+            continue
+
+        available_tables = set(
+            inspector.get_table_names(schema=schema_name)
+        )
+
+        for table_name, key_columns in table_rules.items():
+            key_label = ", ".join(key_columns)
+
+            logging.info(
+                "Validating unique key for table: %s.%s (%s)",
+                schema_name,
+                table_name,
+                key_label,
+            )
+
+            if table_name not in available_tables:
+                results.append(
+                    {
+                        "schema": schema_name,
+                        "table": table_name,
+                        "key_columns": key_label,
+                        "check": "unique_key_no_duplicates",
+                        "checked_rows": None,
+                        "duplicate_group_count": None,
+                        "duplicate_row_count": None,
+                        "duplicate_percentage": None,
+                        "status": "FAIL",
+                        "message": (
+                            "Unique-key validation could not run "
+                            f"because table "
+                            f"'{schema_name}.{table_name}' "
+                            "was not found."
+                        ),
+                    }
+                )
+
+                continue
+
+            available_columns = {
+                column["name"]
+                for column in inspector.get_columns(
+                    table_name=table_name,
+                    schema=schema_name,
+                )
+            }
+
+            missing_columns = [
+                column_name
+                for column_name in key_columns
+                if column_name not in available_columns
+            ]
+
+            if missing_columns:
+                missing_label = ", ".join(missing_columns)
+
+                results.append(
+                    {
+                        "schema": schema_name,
+                        "table": table_name,
+                        "key_columns": key_label,
+                        "check": "unique_key_no_duplicates",
+                        "checked_rows": None,
+                        "duplicate_group_count": None,
+                        "duplicate_row_count": None,
+                        "duplicate_percentage": None,
+                        "status": "FAIL",
+                        "message": (
+                            "Unique-key validation could not run "
+                            f"because the following columns were "
+                            f"not found in "
+                            f"'{schema_name}.{table_name}': "
+                            f"{missing_label}."
+                        ),
+                    }
+                )
+
+                continue
+
+            try:
+                (
+                    checked_rows,
+                    duplicate_group_count,
+                    duplicate_row_count,
+                    duplicate_percentage,
+                ) = count_duplicate_keys(
+                    engine=engine,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    key_columns=key_columns,
+                )
+
+                if checked_rows == 0:
+                    status = "WARNING"
+                    message = (
+                        f"Unique key '{key_label}' could not be "
+                        f"meaningfully assessed because "
+                        f"'{schema_name}.{table_name}' is empty."
+                    )
+
+                elif duplicate_row_count == 0:
+                    status = "PASS"
+                    message = (
+                        f"Unique key '{key_label}' contains no "
+                        f"duplicates across {checked_rows:,} rows "
+                        f"in '{schema_name}.{table_name}'."
+                    )
+
+                else:
+                    status = "FAIL"
+                    message = (
+                        f"Unique key '{key_label}' contains "
+                        f"{duplicate_group_count:,} duplicate groups "
+                        f"and {duplicate_row_count:,} extra rows "
+                        f"({duplicate_percentage:.4f}%) in "
+                        f"'{schema_name}.{table_name}'."
+                    )
+
+                results.append(
+                    {
+                        "schema": schema_name,
+                        "table": table_name,
+                        "key_columns": key_label,
+                        "check": "unique_key_no_duplicates",
+                        "checked_rows": checked_rows,
+                        "duplicate_group_count": (
+                            duplicate_group_count
+                        ),
+                        "duplicate_row_count": (
+                            duplicate_row_count
+                        ),
+                        "duplicate_percentage": (
+                            duplicate_percentage
+                        ),
+                        "status": status,
+                        "message": message,
+                    }
+                )
+
+            except Exception as error:
+                logging.exception(
+                    "Unable to validate unique key for %s.%s",
+                    schema_name,
+                    table_name,
+                )
+
+                results.append(
+                    {
+                        "schema": schema_name,
+                        "table": table_name,
+                        "key_columns": key_label,
+                        "check": "unique_key_no_duplicates",
+                        "checked_rows": None,
+                        "duplicate_group_count": None,
+                        "duplicate_row_count": None,
+                        "duplicate_percentage": None,
+                        "status": "FAIL",
+                        "message": (
+                            "Unique-key validation could not be "
+                            f"completed: {error}"
+                        ),
+                    }
+                )
+
+    return pd.DataFrame(results)
+
+
 # ============================================================
 # REPORTING
 # ============================================================
@@ -641,11 +975,13 @@ def main() -> None:
     try:
         inventory_results = validate_database_inventory(engine)
         required_field_results = validate_required_fields(engine)
+        unique_key_results = validate_unique_keys(engine)
 
         results = pd.concat(
             [
                 inventory_results,
                 required_field_results,
+                unique_key_results,
             ],
             ignore_index=True,
             sort=False,
