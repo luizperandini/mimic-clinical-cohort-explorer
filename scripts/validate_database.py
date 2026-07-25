@@ -142,6 +142,13 @@ REPORT_COLUMNS = [
     "duplicate_group_count",
     "duplicate_row_count",
     "duplicate_percentage",
+    "relationship_name",
+    "child_columns",
+    "parent_schema",
+    "parent_table",
+    "parent_columns",
+    "orphan_row_count",
+    "orphan_percentage",
     "status",
     "message",
 ]
@@ -166,6 +173,66 @@ UNIQUE_KEYS = {
         ],
     },
 }
+
+
+# ============================================================
+# REFERENTIAL-INTEGRITY VALIDATION RULES
+# ============================================================
+
+REFERENTIAL_INTEGRITY_RULES = [
+    {
+        "relationship_name": "admissions_to_patients",
+        "child_schema": "hosp",
+        "child_table": "admissions",
+        "child_columns": [
+            "subject_id",
+        ],
+        "parent_schema": "hosp",
+        "parent_table": "patients",
+        "parent_columns": [
+            "subject_id",
+        ],
+    },
+    {
+        "relationship_name": "icustays_to_patients",
+        "child_schema": "icu",
+        "child_table": "icustays",
+        "child_columns": [
+            "subject_id",
+        ],
+        "parent_schema": "hosp",
+        "parent_table": "patients",
+        "parent_columns": [
+            "subject_id",
+        ],
+    },
+    {
+        "relationship_name": "icustays_to_admissions",
+        "child_schema": "icu",
+        "child_table": "icustays",
+        "child_columns": [
+            "hadm_id",
+        ],
+        "parent_schema": "hosp",
+        "parent_table": "admissions",
+        "parent_columns": [
+            "hadm_id",
+        ],
+    },
+    {
+        "relationship_name": "chartevents_to_icustays",
+        "child_schema": "icu",
+        "child_table": "chartevents",
+        "child_columns": [
+            "stay_id",
+        ],
+        "parent_schema": "icu",
+        "parent_table": "icustays",
+        "parent_columns": [
+            "stay_id",
+        ],
+    },
+]
 
 # ============================================================
 # VALIDATION HELPERS
@@ -359,6 +426,111 @@ def count_duplicate_keys(
         duplicate_row_count,
         duplicate_percentage,
     )
+
+
+def count_orphan_rows(
+    engine: Engine,
+    child_schema: str,
+    child_table: str,
+    child_columns: list[str],
+    parent_schema: str,
+    parent_table: str,
+    parent_columns: list[str],
+) -> tuple[int, int, float]:
+    """
+    Count child rows whose configured parent record does not exist.
+
+    Rows containing NULL in any child relationship column are excluded
+    because missing-value validation is handled separately.
+
+    Returns
+    -------
+    tuple[int, int, float]
+        Number of assessed child rows, orphan rows,
+        and orphan-row percentage.
+    """
+
+    if len(child_columns) != len(parent_columns):
+        raise ValueError(
+            "Child and parent relationships must contain the "
+            "same number of columns."
+        )
+
+    child_table_name = build_qualified_table_name(
+        engine=engine,
+        schema_name=child_schema,
+        table_name=child_table,
+    )
+
+    parent_table_name = build_qualified_table_name(
+        engine=engine,
+        schema_name=parent_schema,
+        table_name=parent_table,
+    )
+
+    preparer = engine.dialect.identifier_preparer
+
+    quoted_child_columns = [
+        preparer.quote(column_name)
+        for column_name in child_columns
+    ]
+
+    quoted_parent_columns = [
+        preparer.quote(column_name)
+        for column_name in parent_columns
+    ]
+
+    child_not_null_condition = " AND ".join(
+        f"child.{column_name} IS NOT NULL"
+        for column_name in quoted_child_columns
+    )
+
+    relationship_condition = " AND ".join(
+        (
+            f"parent.{parent_column} = "
+            f"child.{child_column}"
+        )
+        for child_column, parent_column in zip(
+            quoted_child_columns,
+            quoted_parent_columns,
+            strict=True,
+        )
+    )
+
+    query = text(
+        f"""
+        SELECT
+            COUNT(*) FILTER (
+                WHERE {child_not_null_condition}
+            ) AS checked_rows,
+            COUNT(*) FILTER (
+                WHERE {child_not_null_condition}
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM {parent_table_name} AS parent
+                    WHERE {relationship_condition}
+                )
+            ) AS orphan_row_count
+        FROM {child_table_name} AS child
+        """
+    )
+
+    with engine.connect() as connection:
+        result = connection.execute(query).mappings().one()
+
+    checked_rows = int(result["checked_rows"])
+    orphan_row_count = int(result["orphan_row_count"])
+
+    if checked_rows == 0:
+        orphan_percentage = 0.0
+    else:
+        orphan_percentage = round(
+            (orphan_row_count / checked_rows) * 100,
+            4,
+        )
+
+    return checked_rows, orphan_row_count, orphan_percentage
+
 
 # ============================================================
 # DATABASE INVENTORY VALIDATION
@@ -902,6 +1074,287 @@ def validate_unique_keys(engine: Engine) -> pd.DataFrame:
 
 
 # ============================================================
+# REFERENTIAL-INTEGRITY VALIDATION
+# ============================================================
+
+def validate_referential_integrity(
+    engine: Engine,
+) -> pd.DataFrame:
+    """
+    Validate that configured child identifiers reference existing
+    parent records.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row for each referential-integrity check.
+    """
+
+    inspector = inspect(engine)
+    available_schemas = set(inspector.get_schema_names())
+
+    results: list[dict[str, object]] = []
+
+    for rule in REFERENTIAL_INTEGRITY_RULES:
+        relationship_name = rule["relationship_name"]
+
+        child_schema = rule["child_schema"]
+        child_table = rule["child_table"]
+        child_columns = rule["child_columns"]
+
+        parent_schema = rule["parent_schema"]
+        parent_table = rule["parent_table"]
+        parent_columns = rule["parent_columns"]
+
+        child_column_label = ", ".join(child_columns)
+        parent_column_label = ", ".join(parent_columns)
+
+        logging.info(
+            "Validating relationship: %s.%s (%s) -> %s.%s (%s)",
+            child_schema,
+            child_table,
+            child_column_label,
+            parent_schema,
+            parent_table,
+            parent_column_label,
+        )
+
+        base_result = {
+            "schema": child_schema,
+            "table": child_table,
+            "check": "referential_integrity",
+            "relationship_name": relationship_name,
+            "child_columns": child_column_label,
+            "parent_schema": parent_schema,
+            "parent_table": parent_table,
+            "parent_columns": parent_column_label,
+        }
+
+        if len(child_columns) != len(parent_columns):
+            results.append(
+                {
+                    **base_result,
+                    "checked_rows": None,
+                    "orphan_row_count": None,
+                    "orphan_percentage": None,
+                    "status": "FAIL",
+                    "message": (
+                        f"Relationship '{relationship_name}' is invalid "
+                        "because the number of child and parent columns "
+                        "does not match."
+                    ),
+                }
+            )
+
+            continue
+
+        missing_schemas = [
+            schema_name
+            for schema_name in {
+                child_schema,
+                parent_schema,
+            }
+            if schema_name not in available_schemas
+        ]
+
+        if missing_schemas:
+            missing_schema_label = ", ".join(
+                sorted(missing_schemas)
+            )
+
+            results.append(
+                {
+                    **base_result,
+                    "checked_rows": None,
+                    "orphan_row_count": None,
+                    "orphan_percentage": None,
+                    "status": "FAIL",
+                    "message": (
+                        f"Relationship '{relationship_name}' could not "
+                        "be validated because the following schemas "
+                        f"were not found: {missing_schema_label}."
+                    ),
+                }
+            )
+
+            continue
+
+        child_tables = set(
+            inspector.get_table_names(schema=child_schema)
+        )
+
+        parent_tables = set(
+            inspector.get_table_names(schema=parent_schema)
+        )
+
+        missing_tables = []
+
+        if child_table not in child_tables:
+            missing_tables.append(
+                f"{child_schema}.{child_table}"
+            )
+
+        if parent_table not in parent_tables:
+            missing_tables.append(
+                f"{parent_schema}.{parent_table}"
+            )
+
+        if missing_tables:
+            missing_table_label = ", ".join(missing_tables)
+
+            results.append(
+                {
+                    **base_result,
+                    "checked_rows": None,
+                    "orphan_row_count": None,
+                    "orphan_percentage": None,
+                    "status": "FAIL",
+                    "message": (
+                        f"Relationship '{relationship_name}' could not "
+                        "be validated because the following tables "
+                        f"were not found: {missing_table_label}."
+                    ),
+                }
+            )
+
+            continue
+
+        available_child_columns = {
+            column["name"]
+            for column in inspector.get_columns(
+                table_name=child_table,
+                schema=child_schema,
+            )
+        }
+
+        available_parent_columns = {
+            column["name"]
+            for column in inspector.get_columns(
+                table_name=parent_table,
+                schema=parent_schema,
+            )
+        }
+
+        missing_child_columns = [
+            column_name
+            for column_name in child_columns
+            if column_name not in available_child_columns
+        ]
+
+        missing_parent_columns = [
+            column_name
+            for column_name in parent_columns
+            if column_name not in available_parent_columns
+        ]
+
+        if missing_child_columns or missing_parent_columns:
+            missing_parts = []
+
+            if missing_child_columns:
+                missing_parts.append(
+                    "missing child columns: "
+                    + ", ".join(missing_child_columns)
+                )
+
+            if missing_parent_columns:
+                missing_parts.append(
+                    "missing parent columns: "
+                    + ", ".join(missing_parent_columns)
+                )
+
+            results.append(
+                {
+                    **base_result,
+                    "checked_rows": None,
+                    "orphan_row_count": None,
+                    "orphan_percentage": None,
+                    "status": "FAIL",
+                    "message": (
+                        f"Relationship '{relationship_name}' could not "
+                        "be validated because of "
+                        + "; ".join(missing_parts)
+                        + "."
+                    ),
+                }
+            )
+
+            continue
+
+        try:
+            (
+                checked_rows,
+                orphan_row_count,
+                orphan_percentage,
+            ) = count_orphan_rows(
+                engine=engine,
+                child_schema=child_schema,
+                child_table=child_table,
+                child_columns=child_columns,
+                parent_schema=parent_schema,
+                parent_table=parent_table,
+                parent_columns=parent_columns,
+            )
+
+            if checked_rows == 0:
+                status = "WARNING"
+                message = (
+                    f"Relationship '{relationship_name}' could not be "
+                    "meaningfully assessed because there were no "
+                    "non-null child references."
+                )
+
+            elif orphan_row_count == 0:
+                status = "PASS"
+                message = (
+                    f"Relationship '{relationship_name}' contains no "
+                    f"orphan records across {checked_rows:,} assessed "
+                    "child rows."
+                )
+
+            else:
+                status = "FAIL"
+                message = (
+                    f"Relationship '{relationship_name}' contains "
+                    f"{orphan_row_count:,} orphan rows "
+                    f"({orphan_percentage:.4f}%) across "
+                    f"{checked_rows:,} assessed child rows."
+                )
+
+            results.append(
+                {
+                    **base_result,
+                    "checked_rows": checked_rows,
+                    "orphan_row_count": orphan_row_count,
+                    "orphan_percentage": orphan_percentage,
+                    "status": status,
+                    "message": message,
+                }
+            )
+
+        except Exception as error:
+            logging.exception(
+                "Unable to validate relationship: %s",
+                relationship_name,
+            )
+
+            results.append(
+                {
+                    **base_result,
+                    "checked_rows": None,
+                    "orphan_row_count": None,
+                    "orphan_percentage": None,
+                    "status": "FAIL",
+                    "message": (
+                        f"Relationship '{relationship_name}' could not "
+                        f"be validated: {error}"
+                    ),
+                }
+            )
+
+    return pd.DataFrame(results)
+
+
+# ============================================================
 # REPORTING
 # ============================================================
 
@@ -976,12 +1429,16 @@ def main() -> None:
         inventory_results = validate_database_inventory(engine)
         required_field_results = validate_required_fields(engine)
         unique_key_results = validate_unique_keys(engine)
+        referential_integrity_results = (
+            validate_referential_integrity(engine)
+        )
 
         results = pd.concat(
             [
                 inventory_results,
                 required_field_results,
                 unique_key_results,
+                referential_integrity_results,
             ],
             ignore_index=True,
             sort=False,
