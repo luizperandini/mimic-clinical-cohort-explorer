@@ -46,6 +46,15 @@ It can be downloaded from PhysioNet.
 
 ---
 
+## Data Quality and Validation
+
+The project includes an independent PostgreSQL validation framework:
+
+```bash
+python scripts/validate_database.py
+
+
+
 ## Project Status
 
 🚧 Under development
