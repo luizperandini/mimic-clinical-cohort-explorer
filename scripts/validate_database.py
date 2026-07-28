@@ -26,6 +26,8 @@ REPORT_DIRECTORY = PROJECT_ROOT / "reports" / "validation"
 LOG_DIRECTORY = PROJECT_ROOT / "logs"
 
 REPORT_FILE = REPORT_DIRECTORY / "database_inventory.csv"
+SUMMARY_REPORT_FILE = REPORT_DIRECTORY / "validation_summary.csv"
+
 LOG_FILE = LOG_DIRECTORY / "database_validation.log"
 
 
@@ -151,6 +153,17 @@ REPORT_COLUMNS = [
     "orphan_percentage",
     "status",
     "message",
+]
+
+
+SUMMARY_REPORT_COLUMNS = [
+    "check",
+    "total_checks",
+    "passed",
+    "warnings",
+    "failed",
+    "pass_percentage",
+    "overall_status",
 ]
 
 
@@ -1358,6 +1371,102 @@ def validate_referential_integrity(
 # REPORTING
 # ============================================================
 
+def build_validation_summary(
+    results: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Create a summary of validation results by check type.
+
+    The summary includes one row per validation category and
+    one final row representing the overall database health.
+    """
+
+    summary_rows: list[dict[str, object]] = []
+
+    for check_name, check_results in results.groupby(
+        "check",
+        sort=False,
+    ):
+        status_counts = check_results["status"].value_counts()
+
+        total_checks = len(check_results)
+        passed = int(status_counts.get("PASS", 0))
+        warnings = int(status_counts.get("WARNING", 0))
+        failed = int(status_counts.get("FAIL", 0))
+
+        if total_checks == 0:
+            pass_percentage = 0.0
+        else:
+            pass_percentage = round(
+                (passed / total_checks) * 100,
+                2,
+            )
+
+        if failed > 0:
+            overall_status = "FAIL"
+        elif warnings > 0:
+            overall_status = "WARNING"
+        else:
+            overall_status = "PASS"
+
+        summary_rows.append(
+            {
+                "check": check_name,
+                "total_checks": total_checks,
+                "passed": passed,
+                "warnings": warnings,
+                "failed": failed,
+                "pass_percentage": pass_percentage,
+                "overall_status": overall_status,
+            }
+        )
+
+    overall_status_counts = results["status"].value_counts()
+
+    overall_total = len(results)
+    overall_passed = int(
+        overall_status_counts.get("PASS", 0)
+    )
+    overall_warnings = int(
+        overall_status_counts.get("WARNING", 0)
+    )
+    overall_failed = int(
+        overall_status_counts.get("FAIL", 0)
+    )
+
+    if overall_total == 0:
+        overall_pass_percentage = 0.0
+    else:
+        overall_pass_percentage = round(
+            (overall_passed / overall_total) * 100,
+            2,
+        )
+
+    if overall_failed > 0:
+        database_status = "FAIL"
+    elif overall_warnings > 0:
+        database_status = "WARNING"
+    else:
+        database_status = "PASS"
+
+    summary_rows.append(
+        {
+            "check": "OVERALL",
+            "total_checks": overall_total,
+            "passed": overall_passed,
+            "warnings": overall_warnings,
+            "failed": overall_failed,
+            "pass_percentage": overall_pass_percentage,
+            "overall_status": database_status,
+        }
+    )
+
+    return pd.DataFrame(
+        summary_rows,
+        columns=SUMMARY_REPORT_COLUMNS,
+    )
+
+
 def save_validation_report(results: pd.DataFrame) -> None:
     """
     Save validation results as a CSV file using a consistent column order.
@@ -1374,6 +1483,26 @@ def save_validation_report(results: pd.DataFrame) -> None:
     )
 
     logging.info("Validation report saved to: %s", REPORT_FILE)
+
+def save_validation_summary(
+    summary: pd.DataFrame,
+) -> None:
+    """
+    Save the consolidated validation summary as a CSV file.
+    """
+
+    REPORT_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
+    summary.to_csv(
+        SUMMARY_REPORT_FILE,
+        index=False,
+        encoding="utf-8",
+    )
+
+    logging.info(
+        "Validation summary saved to: %s",
+        SUMMARY_REPORT_FILE,
+    )
 
 
 def print_validation_summary(results: pd.DataFrame) -> None:
@@ -1444,7 +1573,10 @@ def main() -> None:
             sort=False,
         )
 
+        summary = build_validation_summary(results)
+
         save_validation_report(results)
+        save_validation_summary(summary)
         print_validation_summary(results)
 
         logging.info("Database validation completed.")
