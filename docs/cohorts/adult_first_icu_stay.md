@@ -2,7 +2,7 @@
 
 ## Status
 
-Feasibility reviewed on August 1, 2026.
+Feasibility reviewed on August 2, 2026.
 
 The initial cohort design is approved for implementation as reusable SQL.
 
@@ -166,4 +166,5 @@ The completed cohort should verify:
 - ICU discharge occurring after ICU admission;
 - valid patient and hospital-admission relationships;
 - final row count matching the last attrition step.
+
 
