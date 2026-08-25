@@ -50,9 +50,29 @@ purpose to support reproducibility and data lineage.
 | `first_careunit` | `icu.icustays.first_careunit` | Source | First ICU care unit |
 | `last_careunit` | `icu.icustays.last_careunit` | Source | Last ICU care unit |
 
+
+## Diagnosis-Derived Cohort Variables
+
+| Variable | Source | Type | Description |
+|---|---|---|---|
+| `diagnosis_count` | `hosp.diagnoses_icd` | Derived | Number of diagnosis records associated with the index hospital admission |
+| `priority_1_icd_code` | `hosp.diagnoses_icd.icd_code` | Derived selection | ICD code with diagnosis priority (`seq_num`) equal to 1 |
+| `priority_1_icd_version` | `hosp.diagnoses_icd.icd_version` | Derived selection | ICD version associated with the priority-1 diagnosis |
+| `priority_1_diagnosis_title` | `hosp.d_icd_diagnoses.long_title` | Derived selection | Dictionary description of the priority-1 ICD diagnosis |
+
+The `seq_num` field represents diagnosis priority within MIMIC-IV diagnosis
+records. The priority-1 diagnosis is included as a concise descriptor of the
+index admission and should not be interpreted as a complete representation
+of the patient's clinical condition.
+
+The complete set of diagnoses remains available in the long-form
+`adult_first_icu_stay_diagnoses` dataset.
+
 ## Cohort-Level Derived Logic
 
 ### Age at Hospital Admission
+
+
 
 Age is estimated using:
 

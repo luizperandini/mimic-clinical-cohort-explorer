@@ -9,6 +9,10 @@
 -- 3. Age at hospital admission greater than or equal to 18 years.
 -- 4. ICU length of stay greater than or equal to 1.0 day.
 --
+-- Diagnosis enrichment:
+-- Diagnosis records are aggregated to one row per hospital admission before
+-- being joined to the cohort. This preserves the one-row-per-patient grain.
+--
 -- Note:
 -- Explicit timestamp casts are temporarily required because several source
 -- date-time columns are currently stored as text in PostgreSQL.
@@ -104,27 +108,80 @@ ranked_eligible_stays AS (
             ORDER BY icu_intime, stay_id
         ) AS patient_stay_number
     FROM eligible_stays
+),
+
+final_cohort AS (
+    SELECT
+        subject_id,
+        hadm_id,
+        stay_id,
+        gender,
+        age_at_admission,
+        admission_type,
+        race,
+        insurance,
+        marital_status,
+        hospital_expire_flag,
+        hospital_admittime,
+        hospital_dischtime,
+        hospital_los_days,
+        icu_intime,
+        icu_outtime,
+        icu_los_days,
+        first_careunit,
+        last_careunit
+    FROM ranked_eligible_stays
+    WHERE patient_stay_number = 1
+),
+
+diagnosis_summary AS (
+    SELECT
+        dx.subject_id,
+        dx.hadm_id,
+        COUNT(*) AS diagnosis_count,
+        MAX(dx.icd_code) FILTER (
+            WHERE dx.seq_num = 1
+        ) AS priority_1_icd_code,
+        MAX(dx.icd_version) FILTER (
+            WHERE dx.seq_num = 1
+        ) AS priority_1_icd_version,
+        MAX(d.long_title) FILTER (
+            WHERE dx.seq_num = 1
+        ) AS priority_1_diagnosis_title
+    FROM hosp.diagnoses_icd AS dx
+    LEFT JOIN hosp.d_icd_diagnoses AS d
+        ON dx.icd_code = d.icd_code
+        AND dx.icd_version = d.icd_version
+    GROUP BY
+        dx.subject_id,
+        dx.hadm_id
 )
 
 SELECT
-    subject_id,
-    hadm_id,
-    stay_id,
-    gender,
-    age_at_admission,
-    admission_type,
-    race,
-    insurance,
-    marital_status,
-    hospital_expire_flag,
-    hospital_admittime,
-    hospital_dischtime,
-    hospital_los_days,
-    icu_intime,
-    icu_outtime,
-    icu_los_days,
-    first_careunit,
-    last_careunit
-FROM ranked_eligible_stays
-WHERE patient_stay_number = 1
-ORDER BY subject_id;
+    c.subject_id,
+    c.hadm_id,
+    c.stay_id,
+    c.gender,
+    c.age_at_admission,
+    c.admission_type,
+    c.race,
+    c.insurance,
+    c.marital_status,
+    c.hospital_expire_flag,
+    c.hospital_admittime,
+    c.hospital_dischtime,
+    c.hospital_los_days,
+    c.icu_intime,
+    c.icu_outtime,
+    c.icu_los_days,
+    c.first_careunit,
+    c.last_careunit,
+    d.diagnosis_count,
+    d.priority_1_icd_code,
+    d.priority_1_icd_version,
+    d.priority_1_diagnosis_title
+FROM final_cohort AS c
+LEFT JOIN diagnosis_summary AS d
+    ON c.subject_id = d.subject_id
+    AND c.hadm_id = d.hadm_id
+ORDER BY c.subject_id;
