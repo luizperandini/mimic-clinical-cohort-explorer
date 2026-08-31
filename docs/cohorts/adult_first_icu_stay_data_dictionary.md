@@ -68,6 +68,19 @@ of the patient's clinical condition.
 The complete set of diagnoses remains available in the long-form
 `adult_first_icu_stay_diagnoses` dataset.
 
+## Procedure-Derived Cohort Variables
+
+| Variable | Source | Type | Description |
+|---|---|---|---|
+| `has_procedure` | `hosp.procedures_icd` | Derived | Indicator equal to 1 when the index hospital admission has at least one recorded ICD procedure and 0 otherwise |
+| `procedure_count` | `hosp.procedures_icd` | Derived | Number of ICD procedure records associated with the index hospital admission |
+
+Detailed procedure records are maintained separately in the long-form
+`adult_first_icu_stay_procedures` dataset.
+
+Admissions without procedure records remain in the parent cohort with
+`has_procedure = 0` and `procedure_count = 0`.
+
 ## Cohort-Level Derived Logic
 
 ### Age at Hospital Admission

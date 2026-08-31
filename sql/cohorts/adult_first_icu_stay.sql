@@ -13,9 +13,14 @@
 -- Diagnosis records are aggregated to one row per hospital admission before
 -- being joined to the cohort. This preserves the one-row-per-patient grain.
 --
+-- Procedure enrichment:
+-- Procedure records are aggregated to one row per hospital admission before
+-- being joined to the cohort. Admissions without recorded ICD procedures
+-- remain in the cohort with has_procedure = 0 and procedure_count = 0.
+--
 -- Note:
--- Explicit timestamp casts are temporarily required because several source
--- date-time columns are currently stored as text in PostgreSQL.
+-- Explicit timestamp/date casts are temporarily required because several
+-- source date-time columns are currently stored as text in PostgreSQL.
 
 WITH source_icu_stays AS (
     SELECT
@@ -155,6 +160,17 @@ diagnosis_summary AS (
     GROUP BY
         dx.subject_id,
         dx.hadm_id
+),
+
+procedure_summary AS (
+    SELECT
+        p.subject_id,
+        p.hadm_id,
+        COUNT(*) AS procedure_count
+    FROM hosp.procedures_icd AS p
+    GROUP BY
+        p.subject_id,
+        p.hadm_id
 )
 
 SELECT
@@ -179,9 +195,20 @@ SELECT
     d.diagnosis_count,
     d.priority_1_icd_code,
     d.priority_1_icd_version,
-    d.priority_1_diagnosis_title
+    d.priority_1_diagnosis_title,
+    CASE
+        WHEN p.procedure_count IS NULL THEN 0
+        ELSE 1
+    END AS has_procedure,
+    COALESCE(
+        p.procedure_count,
+        0
+    ) AS procedure_count
 FROM final_cohort AS c
 LEFT JOIN diagnosis_summary AS d
     ON c.subject_id = d.subject_id
     AND c.hadm_id = d.hadm_id
+LEFT JOIN procedure_summary AS p
+    ON c.subject_id = p.subject_id
+    AND c.hadm_id = p.hadm_id
 ORDER BY c.subject_id;
